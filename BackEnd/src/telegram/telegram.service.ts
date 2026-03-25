@@ -6,18 +6,21 @@ import { Bot, InlineKeyboard, Context } from 'grammy';
 import { MotoristaService } from '../motorista/motorista.service';
 import { ChatGateway } from '../chat/chat.gateway';
 import { CarregamentoEntity, CidadeGrupo, PedidoOrdemItem } from '../carregamento/entities/carregamento.entity';
+import { CidadeEntity } from '../cidade/entities/cidade.entity';
 
 interface PedidoFlat {
     numdoc: string;
     nomcli: string;
     cidade_nome: string;
     peso_bruto: number;
+    endent?: string;
 }
 
 interface ActiveOrder {
     carregamentoId: number;
     messageId: number;
     pedidos: PedidoFlat[];
+    nome?: string;
 }
 
 @Injectable()
@@ -43,11 +46,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         });
         if (!carregamento) return undefined;
 
-        const pedidos = this.flattenPedidos(carregamento.cidades_em_ordem);
+        const pedidos = await this.flattenPedidos(carregamento.cidades_em_ordem);
         const order: ActiveOrder = {
             carregamentoId: carregamento.id,
             messageId: messageId ?? 0,
             pedidos,
+            nome: carregamento.nome,
         };
         this.activeOrders.set(chatId, order);
         return order;
@@ -59,6 +63,8 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         private readonly chatGateway: ChatGateway,
         @InjectRepository(CarregamentoEntity)
         private readonly carregamentoRepository: Repository<CarregamentoEntity>,
+        @InjectRepository(CidadeEntity)
+        private readonly cidadeRepository: Repository<CidadeEntity>,
     ) {}
 
     async onModuleInit() {
@@ -129,8 +135,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
             this.chatMode.set(chatId, activeOrder.carregamentoId);
             this.chatGateway.emitChatRequest(activeOrder.carregamentoId, motorista.nome);
 
+            const label = activeOrder.nome ?? `Carregamento #${activeOrder.carregamentoId}`;
             await ctx.reply(
-                `💬 Modo conversa ativado para Carregamento #${activeOrder.carregamentoId}.\n\n` +
+                `💬 Modo conversa ativado para ${label}.\n\n` +
                 'Envie suas mensagens normalmente. O operador será notificado.\n' +
                 'Use /sair para voltar ao modo normal.',
             );
@@ -190,9 +197,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
             return;
         }
 
-        const pedidosFlat = this.flattenPedidos(carregamento.cidades_em_ordem);
+        const pedidosFlat = await this.flattenPedidos(carregamento.cidades_em_ordem);
 
-        const text = this.buildOrderText(carregamento.id, pedidosFlat);
+        const text = this.buildOrderText(carregamento.id, pedidosFlat, carregamento.nome);
         const keyboard = this.buildOrderKeyboard(pedidosFlat);
 
         const msg = await this.bot.api.sendMessage(chatId, text, {
@@ -204,7 +211,50 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
             carregamentoId: carregamento.id,
             messageId: msg.message_id,
             pedidos: pedidosFlat,
+            nome: carregamento.nome,
         });
+    }
+
+    /**
+     * Re-sends the updated loading order to the driver.
+     * Deletes the old message and sends a new one, so the driver only sees the latest order.
+     * Clears any active chat mode for the driver.
+     */
+    async reenviarOrdemCarregamento(carregamento: CarregamentoEntity, chatId: string) {
+        if (!this.bot) {
+            this.logger.warn('Bot não inicializado. Impossível reenviar ordem.');
+            return;
+        }
+
+        // Delete the old message if it exists
+        const existingOrder = this.activeOrders.get(chatId);
+        if (existingOrder && existingOrder.messageId) {
+            try {
+                await this.bot.api.deleteMessage(chatId, existingOrder.messageId);
+            } catch (e) {
+                this.logger.warn(`Não foi possível excluir mensagem antiga ${existingOrder.messageId}.`);
+            }
+        }
+
+        // Send a new message with the updated order
+        const pedidosFlat = await this.flattenPedidos(carregamento.cidades_em_ordem);
+        const text = this.buildOrderText(carregamento.id, pedidosFlat, carregamento.nome);
+        const keyboard = this.buildOrderKeyboard(pedidosFlat);
+
+        const msg = await this.bot.api.sendMessage(chatId, text, {
+            parse_mode: 'HTML',
+            reply_markup: keyboard,
+        });
+
+        this.activeOrders.set(chatId, {
+            carregamentoId: carregamento.id,
+            messageId: msg.message_id,
+            pedidos: pedidosFlat,
+            nome: carregamento.nome,
+        });
+
+        // Clear chat mode if active
+        this.chatMode.delete(chatId);
     }
 
     /**
@@ -216,20 +266,43 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     /**
-     * Flatten all city groups into a single ordered list of pedidos
+     * Flatten all city groups into a single ordered list of pedidos.
+     * Looks up endent (address) from each city's ordem_entrega by codcli.
      */
-    private flattenPedidos(cidadesEmOrdem: CidadeGrupo[]): PedidoFlat[] {
+    private async flattenPedidos(cidadesEmOrdem: CidadeGrupo[]): Promise<PedidoFlat[]> {
         const result: PedidoFlat[] = [];
         const sorted = [...cidadesEmOrdem].sort((a, b) => a.ordem - b.ordem);
 
+        // Load all cities at once to get their ordem_entrega
+        const cidadeIds = sorted.map(c => c.cidade_id).filter(id => id > 0);
+        const cidadeEntities = cidadeIds.length > 0
+            ? await this.cidadeRepository.findByIds(cidadeIds)
+            : [];
+        const cidadeMap = new Map(cidadeEntities.map(c => [c.id, c]));
+
         for (const cidade of sorted) {
+            const cidadeEntity = cidadeMap.get(cidade.cidade_id);
+            const ordemEntrega = cidadeEntity?.ordem_entrega || [];
+
             const pedidos = [...cidade.pedidos].sort((a, b) => a.ordem - b.ordem);
             for (const p of pedidos) {
+                // Always look up endent from the city's ordem_entrega by codcli
+                let endent: string | undefined;
+                if (p.codcli && ordemEntrega.length > 0) {
+                    const match = ordemEntrega.find(oe => oe.codcli === p.codcli);
+                    endent = match?.endent;
+                }
+                // Fallback to stored endent if codcli lookup failed
+                if (!endent) {
+                    endent = p.endent;
+                }
+
                 result.push({
                     numdoc: p.numdoc,
                     nomcli: p.nomcli,
                     cidade_nome: cidade.cidade_nome,
                     peso_bruto: p.peso_bruto,
+                    endent,
                 });
             }
         }
@@ -237,16 +310,23 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         return result;
     }
 
-    private buildOrderText(carregamentoId: number, pedidos: PedidoFlat[]): string {
+    private buildOrderText(carregamentoId: number, pedidos: PedidoFlat[], nome?: string): string {
         const pesoTotal = pedidos.reduce((sum, p) => sum + p.peso_bruto, 0);
-        let text = `📦 <b>Carregamento #${carregamentoId}</b>\n`;
+        const label = nome ?? `Carregamento #${carregamentoId}`;
+        let text = `📦 <b>${label}</b>\n`;
         text += `<b>Ordem de Carregamento</b>\n`;
         text += `⚖️ Peso total: <b>${pesoTotal.toFixed(2).replace('.', ',')} kg</b>\n\n`;
 
         pedidos.forEach((p, idx) => {
             const peso = p.peso_bruto.toFixed(2).replace('.', ',');
             const nomcli = p.nomcli.length > 25 ? p.nomcli.substring(0, 25) + '…' : p.nomcli;
-            text += `<b>${idx + 1}.</b> ${p.numdoc} | ${nomcli} | ${p.cidade_nome} | ${peso} kg\n`;
+            let line = `<b>${idx + 1}.</b> ${p.numdoc} | ${nomcli}`;
+            if (p.endent) {
+                const addr = p.endent.length > 30 ? p.endent.substring(0, 30) + '…' : p.endent;
+                line += ` | 📍 ${addr}`;
+            }
+            line += ` | ${p.cidade_nome} | ${peso} kg`;
+            text += line + '\n';
         });
 
         text += `\n⬆️⬇️ Use os botões para reordenar\n✅ Confirme quando estiver pronto`;
@@ -298,7 +378,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         [order.pedidos[idx], order.pedidos[swapIdx]] = [order.pedidos[swapIdx], order.pedidos[idx]];
 
         // Edit the message with updated order
-        const text = this.buildOrderText(order.carregamentoId, order.pedidos);
+        const text = this.buildOrderText(order.carregamentoId, order.pedidos, order.nome);
         const keyboard = this.buildOrderKeyboard(order.pedidos);
 
         try {
@@ -333,15 +413,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         const motorista = await this.motoristaService.findByChatId(chatId);
 
         // Notify frontend via WebSocket
-        this.chatGateway.emitStatusUpdate(order.carregamentoId, 'ordenado', motorista?.nome);
+        this.chatGateway.emitStatusUpdate(order.carregamentoId, 'ordenado', motorista?.nome, order.nome);
 
         // Clean up
         this.activeOrders.delete(chatId);
         this.chatMode.delete(chatId);
 
+        const label = order.nome ?? `Carregamento #${order.carregamentoId}`;
         await ctx.editMessageText(
             `✅ <b>Ordem Confirmada!</b>\n\n` +
-            `Carregamento #${order.carregamentoId} - Ordem de carregamento confirmada.\n` +
+            `${label} - Ordem de carregamento confirmada.\n` +
             `O operador será notificado.`,
             { parse_mode: 'HTML' },
         );
@@ -354,12 +435,16 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
         originalCidades: CidadeGrupo[],
         flatOrder: PedidoFlat[],
     ): CidadeGrupo[] {
-        // Build lookup for itens from original data so they are preserved
+        // Build lookups for itens and endent from original data so they are preserved
         const itensMap = new Map<string, PedidoOrdemItem['itens']>();
+        const endentMap = new Map<string, string>();
         for (const cidade of originalCidades) {
             for (const p of cidade.pedidos) {
                 if (p.itens && p.itens.length > 0) {
                     itensMap.set(p.numdoc, p.itens);
+                }
+                if (p.endent) {
+                    endentMap.set(p.numdoc, p.endent);
                 }
             }
         }
@@ -378,6 +463,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
                 nomcli: item.nomcli,
                 peso_bruto: item.peso_bruto,
                 itens: itensMap.get(item.numdoc),
+                endent: endentMap.get(item.numdoc),
             });
         }
 
@@ -419,10 +505,11 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
         this.chatGateway.emitChatRequest(order.carregamentoId, motorista.nome);
 
+        const label = order.nome ?? `Carregamento #${order.carregamentoId}`;
         await ctx.answerCallbackQuery({ text: 'Modo conversa ativado!' });
         await this.bot?.api.sendMessage(
             chatId,
-            `💬 Modo conversa ativado para Carregamento #${order.carregamentoId}.\n\n` +
+            `💬 Modo conversa ativado para ${label}.\n\n` +
             'Envie suas mensagens normalmente. O operador será notificado.\n' +
             'Use /sair para voltar ao modo normal.',
         );

@@ -9,6 +9,7 @@ export interface PedidoOrdemItem {
     peso_bruto: number;
     codcli?: number;
     itens?: PedidoItem[];
+    endent?: string;
 }
 
 export interface CidadeGrupo {
@@ -25,6 +26,9 @@ export class CarregamentoEntity {
 
     @Column({ default: 'rascunho' })
     status: string;
+
+    @Column({ nullable: true })
+    nome: string;
 
     @Column({ type: 'jsonb', default: [] })
     cidades_em_ordem: CidadeGrupo[];

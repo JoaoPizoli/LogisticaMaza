@@ -35,7 +35,13 @@ export class CarregamentoService {
         this.learningThreshold = this.configService.get<number>('LEARNING_THRESHOLD', 2);
     }
 
-    create(createCarregamentoDto: CreateCarregamentoDto) {
+    async create(createCarregamentoDto: CreateCarregamentoDto) {
+        if (createCarregamentoDto.rota_id && !createCarregamentoDto.nome) {
+            const rota = await this.rotaRepository.findOneBy({ id: createCarregamentoDto.rota_id });
+            if (rota) {
+                createCarregamentoDto.nome = rota.nome;
+            }
+        }
         const carregamento = this.carregamentoRepository.create(createCarregamentoDto);
         return this.carregamentoRepository.save(carregamento);
     }
@@ -53,6 +59,12 @@ export class CarregamentoService {
     }
 
     async update(id: number, updateCarregamentoDto: UpdateCarregamentoDto) {
+        if (updateCarregamentoDto.rota_id && !updateCarregamentoDto.nome) {
+            const rota = await this.rotaRepository.findOneBy({ id: updateCarregamentoDto.rota_id });
+            if (rota) {
+                updateCarregamentoDto.nome = rota.nome;
+            }
+        }
         const carregamento = await this.carregamentoRepository.preload({
             id,
             ...updateCarregamentoDto,
@@ -117,8 +129,7 @@ export class CarregamentoService {
 
     /**
      * Ordena pedidos segundo o ordem_entrega da cidade.
-     * Agrupa por nomcli e respeita a ordem do JSONB.
-     * Clientes desconhecidos vão para o final.
+     * Match por codcli (exato). Clientes sem match vão para o final.
      */
     private ordenarPedidos(
         pedidos: PedidosEntity[],
@@ -126,73 +137,44 @@ export class CarregamentoService {
     ): PedidoOrdemItem[] {
         if (pedidos.length === 0) return [];
 
-        // Agrupar pedidos por nomcli
-        const pedidosPorCliente = new Map<string, PedidosEntity[]>();
-        for (const p of pedidos) {
-            const key = p.nomcli.trim();
-            if (!pedidosPorCliente.has(key)) {
-                pedidosPorCliente.set(key, []);
-            }
-            pedidosPorCliente.get(key)!.push(p);
-        }
-
         const resultado: PedidoOrdemItem[] = [];
-        const clientesUsados = new Set<string>();
+        const pedidosUsados = new Set<number>();
         let ordem = 1;
 
-        // Se temos ordem_entrega, tentar ordenar por ela
-        // O ordem_entrega usa codcli e endent. Como pedidos têm nomcli,
-        // vamos fazer match pelo endent (que geralmente contém o nome do cliente)
-        // ou simplesmente manter a ordem dos clientes como aparecem
+        // Normalizar codcli da ordem_entrega para 8 dígitos (string) para comparação
+        // cidade armazena como number (ex: 20318), pedido armazena como number (ex: 20318)
         if (ordemEntrega.length > 0) {
-            // Tentar match: para cada entrada no ordem_entrega,
-            // buscar um cliente nos pedidos cujo nome contenha o endent ou vice-versa
             for (const oe of ordemEntrega) {
-                for (const [nomcli, pedidosCliente] of pedidosPorCliente) {
-                    if (clientesUsados.has(nomcli)) continue;
+                // Buscar todos os pedidos que pertencem a este cliente por codcli
+                const pedidosDoCliente = pedidos.filter(
+                    (p) => !pedidosUsados.has(p.id) && p.codcli != null && p.codcli === oe.codcli,
+                );
 
-                    // Match: se o endent contém parte do nomcli ou vice-versa
-                    const endent = (oe.endent || '').toUpperCase();
-                    const nomUpper = nomcli.toUpperCase();
-
-                    // Match direto por nome
-                    const isMatch = endent && (
-                        nomUpper.includes(endent) ||
-                        endent.includes(nomUpper) ||
-                        // Match parcial: primeiras palavras
-                        nomUpper.split(' ')[0] === endent.split(' ')[0]
-                    );
-
-                    if (isMatch) {
-                        for (const p of pedidosCliente) {
-                            resultado.push({
-                                numdoc: p.numdoc,
-                                ordem: ordem++,
-                                nomcli: p.nomcli,
-                                peso_bruto: p.peso_bruto,
-                                codcli: oe.codcli,
-                                itens: p.itens || [],
-                            });
-                        }
-                        clientesUsados.add(nomcli);
-                        break;
-                    }
+                for (const p of pedidosDoCliente) {
+                    resultado.push({
+                        numdoc: p.numdoc,
+                        ordem: ordem++,
+                        nomcli: p.nomcli,
+                        peso_bruto: p.peso_bruto,
+                        codcli: oe.codcli,
+                        itens: p.itens || [],
+                        endent: oe.endent,
+                    });
+                    pedidosUsados.add(p.id);
                 }
             }
         }
 
-        // Adicionar clientes restantes (sem match no ordem_entrega)
-        for (const [nomcli, pedidosCliente] of pedidosPorCliente) {
-            if (clientesUsados.has(nomcli)) continue;
-            for (const p of pedidosCliente) {
-                resultado.push({
-                    numdoc: p.numdoc,
-                    ordem: ordem++,
-                    nomcli: p.nomcli,
-                    peso_bruto: p.peso_bruto,
-                    itens: p.itens || [],
-                });
-            }
+        // Adicionar pedidos restantes (sem match por codcli)
+        for (const p of pedidos) {
+            if (pedidosUsados.has(p.id)) continue;
+            resultado.push({
+                numdoc: p.numdoc,
+                ordem: ordem++,
+                nomcli: p.nomcli,
+                peso_bruto: p.peso_bruto,
+                itens: p.itens || [],
+            });
         }
 
         return resultado;
@@ -226,7 +208,43 @@ export class CarregamentoService {
         carregamento.status = 'enviado';
         const saved = await this.carregamentoRepository.save(carregamento);
 
-        this.chatGateway.emitStatusUpdate(id, 'enviado', motorista.nome);
+        this.chatGateway.emitStatusUpdate(id, 'enviado', motorista.nome, carregamento.nome);
+
+        return saved;
+    }
+
+    /**
+     * Reenvia o carregamento para o motorista após edição pelo usuário.
+     * Válido para status 'enviado' ou 'ordenado'. Volta o status para 'enviado'.
+     */
+    async reenviarParaMotorista(id: number) {
+        const carregamento = await this.findOne(id);
+
+        if (carregamento.status !== 'enviado' && carregamento.status !== 'ordenado') {
+            throw new BadRequestException(
+                'Apenas carregamentos enviados ou ordenados podem ser reenviados',
+            );
+        }
+
+        if (!carregamento.motorista_id) {
+            throw new BadRequestException('Nenhum motorista alocado a este carregamento');
+        }
+
+        const motorista = await this.motoristaService.findOne(carregamento.motorista_id);
+
+        if (!motorista.telegram_chat_id) {
+            throw new BadRequestException(
+                `Motorista "${motorista.nome}" ainda não vinculou o Telegram. ` +
+                `Código de vinculação: ${motorista.codigo_vinculacao}`,
+            );
+        }
+
+        await this.telegramService.reenviarOrdemCarregamento(carregamento, motorista.telegram_chat_id);
+
+        carregamento.status = 'enviado';
+        const saved = await this.carregamentoRepository.save(carregamento);
+
+        this.chatGateway.emitStatusUpdate(id, 'enviado', motorista.nome, carregamento.nome);
 
         return saved;
     }
@@ -250,7 +268,7 @@ export class CarregamentoService {
         const saved = await this.carregamentoRepository.save(carregamento);
 
         const motorista = carregamento.motorista;
-        this.chatGateway.emitStatusUpdate(id, 'ordenado', motorista?.nome);
+        this.chatGateway.emitStatusUpdate(id, 'ordenado', motorista?.nome, carregamento.nome);
 
         return saved;
     }
@@ -395,12 +413,31 @@ export class CarregamentoService {
             cidadeGrupo = novoGrupo;
         }
 
+        // Buscar endent da ordem_entrega da cidade, se disponível
+        let endent: string | undefined;
+        if (cidadeGrupo.cidade_id) {
+            const cidadeComOrdem = await this.cidadeRepository.findOneBy({ id: cidadeGrupo.cidade_id });
+            if (cidadeComOrdem?.ordem_entrega) {
+                const nomUpper = pedido.nomcli.trim().toUpperCase();
+                const match = cidadeComOrdem.ordem_entrega.find(oe => {
+                    const oe_endent = (oe.endent || '').toUpperCase();
+                    return oe_endent && (
+                        nomUpper.includes(oe_endent) ||
+                        oe_endent.includes(nomUpper) ||
+                        nomUpper.split(' ')[0] === oe_endent.split(' ')[0]
+                    );
+                });
+                endent = match?.endent;
+            }
+        }
+
         cidadeGrupo.pedidos.push({
             numdoc: pedido.numdoc,
             ordem: cidadeGrupo.pedidos.length + 1,
             nomcli: pedido.nomcli,
             peso_bruto: pedido.peso_bruto,
             itens: pedido.itens || [],
+            endent,
         });
 
         // Recalcular peso total

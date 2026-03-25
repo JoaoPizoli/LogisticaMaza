@@ -91,10 +91,12 @@ export class ChatGateway {
             .emit('new_message', mensagem);
 
         // Also broadcast a notification to all connected clients
+        const carregamentoEntity = await this.carregamentoRepository.findOneBy({ id: carregamentoId });
         this.server.emit('notificacao', {
             tipo: 'nova_mensagem',
             carregamentoId,
             mensagem: conteudo,
+            nome: carregamentoEntity?.nome,
         });
 
         return mensagem;
@@ -103,22 +105,25 @@ export class ChatGateway {
     /**
      * Notify all connected clients of a carregamento status update
      */
-    emitStatusUpdate(carregamentoId: number, status: string, motoristaName?: string) {
+    emitStatusUpdate(carregamentoId: number, status: string, motoristaName?: string, nome?: string) {
         this.server.emit('carregamento_status_update', {
             carregamentoId,
             status,
             motoristaName,
+            nome,
         });
     }
 
     /**
      * Notify about chat request from driver
      */
-    emitChatRequest(carregamentoId: number, motoristaName: string) {
+    async emitChatRequest(carregamentoId: number, motoristaName: string) {
+        const carregamento = await this.carregamentoRepository.findOneBy({ id: carregamentoId });
         this.server.emit('notificacao', {
             tipo: 'chat_solicitado',
             carregamentoId,
             motoristaName,
+            nome: carregamento?.nome,
         });
     }
 }

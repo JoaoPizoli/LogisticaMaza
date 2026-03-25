@@ -22,6 +22,10 @@ class PedidoOrdemItemDto {
     @IsArray()
     @IsOptional()
     itens?: PedidoItem[];
+
+    @IsString()
+    @IsOptional()
+    endent?: string;
 }
 
 class CidadeGrupoDto {
@@ -57,6 +61,10 @@ export class CreateCarregamentoDto {
     @IsNumber()
     @IsOptional()
     rota_id?: number;
+
+    @IsString()
+    @IsOptional()
+    nome?: string;
 
     @IsString()
     @IsOptional()

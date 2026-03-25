@@ -50,6 +50,11 @@ export class CarregamentoController {
         return this.carregamentoService.confirmarOrdenacao(id);
     }
 
+    @Patch('reenviar/:id')
+    reenviar(@Param('id', ParseIntPipe) id: number) {
+        return this.carregamentoService.reenviarParaMotorista(id);
+    }
+
     @Patch(':id')
     update(@Param('id', ParseIntPipe) id: number, @Body() updateCarregamentoDto: UpdateCarregamentoDto) {
         return this.carregamentoService.update(id, updateCarregamentoDto);

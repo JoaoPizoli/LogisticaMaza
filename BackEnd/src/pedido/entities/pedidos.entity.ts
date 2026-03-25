@@ -58,6 +58,9 @@ export class PedidosEntity {
     @Column({ nullable: true })
     desuni: string;
 
+    @Column({ nullable: true })
+    codcli: number;
+
     @Column({ type: 'jsonb', default: [] })
     itens: PedidoItem[];
 
